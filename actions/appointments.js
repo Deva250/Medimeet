@@ -6,37 +6,28 @@ import { revalidatePath } from "next/cache";
 import { Vonage } from "@vonage/server-sdk";
 import { addDays, addMinutes, format, isBefore, endOfDay } from "date-fns";
 import { Auth } from "@vonage/auth";
+import { sendBookingEmail, sendReminderEmail } from "@/lib/email";
 
 // Initialize Vonage Video API client
 const credentials = new Auth({
   applicationId: process.env.NEXT_PUBLIC_VONAGE_APPLICATION_ID,
   privateKey: process.env.VONAGE_PRIVATE_KEY,
 });
-const options = {};
-const vonage = new Vonage(credentials, options);
+const vonage = new Vonage(credentials, {});
 
 /**
- * Book a new appointment with a doctor
+ * 📅 Book a new appointment
  */
 export async function bookAppointment(formData) {
   const { userId } = await auth();
-
-  if (!userId) {
-    throw new Error("Unauthorized");
-  }
+  if (!userId) throw new Error("Unauthorized");
 
   try {
-    // Get the patient user
+    // 🧍 Get the patient user
     const patient = await db.user.findUnique({
-      where: {
-        clerkUserId: userId,
-        role: "PATIENT",
-      },
+      where: { clerkUserId: userId, role: "PATIENT" },
     });
-
-    if (!patient) {
-      throw new Error("Patient not found");
-    }
+    if (!patient) throw new Error("Patient not found");
 
     // Parse form data
     const doctorId = formData.get("doctorId");
@@ -44,57 +35,33 @@ export async function bookAppointment(formData) {
     const endTime = new Date(formData.get("endTime"));
     const patientDescription = formData.get("description") || null;
 
-    // Validate input
-    if (!doctorId || !startTime || !endTime) {
+    if (!doctorId || !startTime || !endTime)
       throw new Error("Doctor, start time, and end time are required");
-    }
 
-    // Check if the doctor exists and is verified
+    // 🧑‍⚕️ Check doctor
     const doctor = await db.user.findUnique({
-      where: {
-        id: doctorId,
-        role: "DOCTOR",
-        verificationStatus: "VERIFIED",
-      },
+      where: { id: doctorId, role: "DOCTOR", verificationStatus: "VERIFIED" },
     });
+    if (!doctor) throw new Error("Doctor not found or not verified");
 
-    if (!doctor) {
-      throw new Error("Doctor not found or not verified");
-    }
-
-    // Check if the requested time slot is available
+    // 🕐 Check if slot available
     const overlappingAppointment = await db.appointment.findFirst({
       where: {
-        doctorId: doctorId,
+        doctorId,
         status: "SCHEDULED",
         OR: [
-          {
-            startTime: { lte: startTime },
-            endTime: { gt: startTime },
-          },
-          {
-            startTime: { lt: endTime },
-            endTime: { gte: endTime },
-          },
-          {
-            startTime: { gte: startTime },
-            endTime: { lte: endTime },
-          },
+          { startTime: { lte: startTime }, endTime: { gt: startTime } },
+          { startTime: { lt: endTime }, endTime: { gte: endTime } },
+          { startTime: { gte: startTime }, endTime: { lte: endTime } },
         ],
       },
     });
+    if (overlappingAppointment) throw new Error("This time slot is already booked");
 
-    if (overlappingAppointment) {
-      throw new Error("This time slot is already booked");
-    }
-
-    // Create a new Vonage Video API session
+    // 🧩 Create video session
     const sessionId = await createVideoSession();
 
-    // 🧹 CREDIT SYSTEM REMOVED HERE 👇
-    // Previously: deductCreditsForAppointment(patient.id, doctor.id)
-
-    // Create the appointment with the video session ID
+    // 💾 Create appointment
     const appointment = await db.appointment.create({
       data: {
         patientId: patient.id,
@@ -107,8 +74,47 @@ export async function bookAppointment(formData) {
       },
     });
 
+    // ✅ Send booking confirmation emails
+    const formattedDate = format(startTime, "EEEE, MMMM d, yyyy 'at' h:mm a");
+
+    const patientMsg = `
+Hi ${patient.name},
+
+Your appointment with Dr. ${doctor.name} has been successfully booked!
+
+📅 Date: ${formattedDate}
+💬 Description: ${patientDescription || "No description provided"}
+
+— medimeet Team
+`;
+    await sendBookingEmail(patient.email, "Appointment Confirmation", patientMsg);
+
+    const doctorMsg = `
+Hi Dr. ${doctor.name},
+
+Your appointment has been booked with you.
+
+👤 Patient: ${patient.name}
+📅 Date: ${formattedDate}
+💬 Description: ${patientDescription || "No description provided"}
+
+— Medimeet Team
+`;
+    await sendBookingEmail(doctor.email, "New Appointment Booked", doctorMsg);
+
+    // ⏰ Schedule 1-hour reminder
+    const now = new Date();
+    const reminderTime = startTime.getTime() - 60 * 60 * 1000; // 1 hour before
+    const delay = reminderTime - now.getTime();
+
+    if (delay > 0) {
+      setTimeout(async () => {
+        await sendReminderEmail(patient, doctor, startTime);
+      }, delay);
+    }
+
     revalidatePath("/appointments");
-    return { success: true, appointment: appointment };
+    return { success: true, appointment };
   } catch (error) {
     console.error("Failed to book appointment:", error);
     throw error;
@@ -116,7 +122,7 @@ export async function bookAppointment(formData) {
 }
 
 /**
- * Generate a Vonage Video API session
+ * 🎥 Create Vonage Video API session
  */
 async function createVideoSession() {
   try {
@@ -128,63 +134,36 @@ async function createVideoSession() {
 }
 
 /**
- * Generate a token for a video session
+ * 🎟️ Generate video session token
  */
 export async function generateVideoToken(formData) {
   const { userId } = await auth();
-
-  if (!userId) {
-    throw new Error("Unauthorized");
-  }
+  if (!userId) throw new Error("Unauthorized");
 
   try {
-    const user = await db.user.findUnique({
-      where: {
-        clerkUserId: userId,
-      },
-    });
-
-    if (!user) {
-      throw new Error("User not found");
-    }
+    const user = await db.user.findUnique({ where: { clerkUserId: userId } });
+    if (!user) throw new Error("User not found");
 
     const appointmentId = formData.get("appointmentId");
+    if (!appointmentId) throw new Error("Appointment ID is required");
 
-    if (!appointmentId) {
-      throw new Error("Appointment ID is required");
-    }
+    const appointment = await db.appointment.findUnique({ where: { id: appointmentId } });
+    if (!appointment) throw new Error("Appointment not found");
 
-    const appointment = await db.appointment.findUnique({
-      where: {
-        id: appointmentId,
-      },
-    });
-
-    if (!appointment) {
-      throw new Error("Appointment not found");
-    }
-
-    if (appointment.doctorId !== user.id && appointment.patientId !== user.id) {
+    if (appointment.doctorId !== user.id && appointment.patientId !== user.id)
       throw new Error("You are not authorized to join this call");
-    }
 
-    if (appointment.status !== "SCHEDULED") {
+    if (appointment.status !== "SCHEDULED")
       throw new Error("This appointment is not currently scheduled");
-    }
 
     const now = new Date();
     const appointmentTime = new Date(appointment.startTime);
     const timeDifference = (appointmentTime - now) / (1000 * 60);
-
-    if (timeDifference > 30) {
-      throw new Error(
-        "The call will be available 30 minutes before the scheduled time"
-      );
-    }
+    if (timeDifference > 30)
+      throw new Error("The call will be available 30 minutes before the scheduled time");
 
     const appointmentEndTime = new Date(appointment.endTime);
-    const expirationTime =
-      Math.floor(appointmentEndTime.getTime() / 1000) + 60 * 60;
+    const expirationTime = Math.floor(appointmentEndTime.getTime() / 1000) + 60 * 60;
 
     const connectionData = JSON.stringify({
       name: user.name,
@@ -203,11 +182,7 @@ export async function generateVideoToken(formData) {
       data: { videoSessionToken: token },
     });
 
-    return {
-      success: true,
-      videoSessionId: appointment.videoSessionId,
-      token: token,
-    };
+    return { success: true, videoSessionId: appointment.videoSessionId, token };
   } catch (error) {
     console.error("Failed to generate video token:", error);
     throw new Error("Failed to generate video token:" + error.message);
@@ -215,22 +190,14 @@ export async function generateVideoToken(formData) {
 }
 
 /**
- * Get doctor by ID
+ * 🧑‍⚕️ Get doctor by ID
  */
 export async function getDoctorById(doctorId) {
   try {
     const doctor = await db.user.findUnique({
-      where: {
-        id: doctorId,
-        role: "DOCTOR",
-        verificationStatus: "VERIFIED",
-      },
+      where: { id: doctorId, role: "DOCTOR", verificationStatus: "VERIFIED" },
     });
-
-    if (!doctor) {
-      throw new Error("Doctor not found");
-    }
-
+    if (!doctor) throw new Error("Doctor not found");
     return { doctor };
   } catch (error) {
     console.error("Failed to fetch doctor:", error);
@@ -239,44 +206,26 @@ export async function getDoctorById(doctorId) {
 }
 
 /**
- * Get available time slots for booking for the next 4 days
+ * ⏰ Get available time slots for next 4 days
  */
 export async function getAvailableTimeSlots(doctorId) {
   try {
     const doctor = await db.user.findUnique({
-      where: {
-        id: doctorId,
-        role: "DOCTOR",
-        verificationStatus: "VERIFIED",
-      },
+      where: { id: doctorId, role: "DOCTOR", verificationStatus: "VERIFIED" },
     });
-
-    if (!doctor) {
-      throw new Error("Doctor not found or not verified");
-    }
+    if (!doctor) throw new Error("Doctor not found or not verified");
 
     const availability = await db.availability.findFirst({
-      where: {
-        doctorId: doctor.id,
-        status: "AVAILABLE",
-      },
+      where: { doctorId: doctor.id, status: "AVAILABLE" },
     });
-
-    if (!availability) {
-      throw new Error("No availability set by doctor");
-    }
+    if (!availability) throw new Error("No availability set by doctor");
 
     const now = new Date();
     const days = [now, addDays(now, 1), addDays(now, 2), addDays(now, 3)];
     const lastDay = endOfDay(days[3]);
+
     const existingAppointments = await db.appointment.findMany({
-      where: {
-        doctorId: doctor.id,
-        status: "SCHEDULED",
-        startTime: {
-          lte: lastDay,
-        },
-      },
+      where: { doctorId: doctor.id, status: "SCHEDULED", startTime: { lte: lastDay } },
     });
 
     const availableSlotsByDay = {};
@@ -287,36 +236,22 @@ export async function getAvailableTimeSlots(doctorId) {
 
       const availabilityStart = new Date(availability.startTime);
       const availabilityEnd = new Date(availability.endTime);
-
-      availabilityStart.setFullYear(
-        day.getFullYear(),
-        day.getMonth(),
-        day.getDate()
-      );
-      availabilityEnd.setFullYear(
-        day.getFullYear(),
-        day.getMonth(),
-        day.getDate()
-      );
+      availabilityStart.setFullYear(day.getFullYear(), day.getMonth(), day.getDate());
+      availabilityEnd.setFullYear(day.getFullYear(), day.getMonth(), day.getDate());
 
       let current = new Date(availabilityStart);
       const end = new Date(availabilityEnd);
 
-      while (
-        isBefore(addMinutes(current, 30), end) ||
-        +addMinutes(current, 30) === +end
-      ) {
+      while (isBefore(addMinutes(current, 30), end) || +addMinutes(current, 30) === +end) {
         const next = addMinutes(current, 30);
-
         if (isBefore(current, now)) {
           current = next;
           continue;
         }
 
-        const overlaps = existingAppointments.some((appointment) => {
-          const aStart = new Date(appointment.startTime);
-          const aEnd = new Date(appointment.endTime);
-
+        const overlaps = existingAppointments.some((appt) => {
+          const aStart = new Date(appt.startTime);
+          const aEnd = new Date(appt.endTime);
           return (
             (current >= aStart && current < aEnd) ||
             (next > aStart && next <= aEnd) ||
@@ -328,10 +263,7 @@ export async function getAvailableTimeSlots(doctorId) {
           availableSlotsByDay[dayString].push({
             startTime: current.toISOString(),
             endTime: next.toISOString(),
-            formatted: `${format(current, "h:mm a")} - ${format(
-              next,
-              "h:mm a"
-            )}`,
+            formatted: `${format(current, "h:mm a")} - ${format(next, "h:mm a")}`,
             day: format(current, "EEEE, MMMM d"),
           });
         }
@@ -342,10 +274,7 @@ export async function getAvailableTimeSlots(doctorId) {
 
     const result = Object.entries(availableSlotsByDay).map(([date, slots]) => ({
       date,
-      displayDate:
-        slots.length > 0
-          ? slots[0].day
-          : format(new Date(date), "EEEE, MMMM d"),
+      displayDate: slots.length > 0 ? slots[0].day : format(new Date(date), "EEEE, MMMM d"),
       slots,
     }));
 
